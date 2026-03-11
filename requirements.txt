@@ -1,2 +1,4 @@
 xarray[complete]
 matplotlib
+planetary_computer
+pystac_client
