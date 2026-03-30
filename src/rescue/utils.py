@@ -1,8 +1,13 @@
+import os
+
 import torch
 import tqdm
 import xarray as xr
 import numpy as np
 import cv2
+
+import trimesh
+import pyrender
 
 
 def get_png_from_naip(naip_path):
@@ -116,3 +121,61 @@ def collate_sam3_results(results, prompts):
     scores = torch.cat(scores).numpy()
 
     return masks, bboxes, scores, labels
+
+
+def look_at(eye, target, up):
+    zaxis = eye - target
+    zaxis /= np.linalg.norm(zaxis)
+    xaxis = np.cross(up, zaxis)
+    xaxis /= np.linalg.norm(xaxis)
+    yaxis = np.cross(zaxis, xaxis)
+
+    view_matrix = np.eye(4)
+    view_matrix[:3, 0] = xaxis
+    view_matrix[:3, 1] = yaxis
+    view_matrix[:3, 2] = zaxis
+    view_matrix[:3, 3] = eye
+    return view_matrix
+
+
+def render_3d_plot_from_above(
+    recon_path,
+    bg_color=[255, 255, 255, 255],
+    ambient_light=np.ones(4, dtype="uint8") * 200,
+):
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    scene = trimesh.load(recon_path)
+    geometry_names = list(scene.geometry.keys())
+
+    print(f"Found num geometries: {len(geometry_names)}")
+
+    render_scene = pyrender.Scene(
+        bg_color=[255, 255, 255, 255], ambient_light=np.ones(4, dtype="uint8") * 200
+    )
+
+    # 1. Collect all trimesh objects in a list
+    meshes = [scene.geometry[name] for name in geometry_names]
+    # 2. Combine them into one single trimesh
+
+    combined_trimesh = trimesh.util.concatenate(meshes)
+
+    scene_to_render = pyrender.Scene(bg_color=bg_color, ambient_light=ambient_light)
+    render_mesh = pyrender.Mesh.from_trimesh(combined_trimesh)
+    scene_to_render.add(render_mesh)
+
+    center = combined_trimesh.centroid
+    eye = np.array([center[0], center[1], 0.0])
+    target = center
+
+    up = np.array([0, 1, 0])
+    camera_pose = look_at(eye, target, up)
+
+    mag = max(combined_trimesh.extents[:2]) / 2.0
+
+    camera = pyrender.OrthographicCamera(xmag=mag, ymag=mag, znear=0.01, zfar=100.0)
+    scene_to_render.add(camera, pose=camera_pose)
+
+    r = pyrender.OffscreenRenderer(1024, 1024)
+    color, depth = r.render(scene_to_render)
+
+    return color, depth
