@@ -2,3 +2,4 @@ xarray[complete]
 matplotlib
 planetary_computer
 pystac_client
+pymap3d

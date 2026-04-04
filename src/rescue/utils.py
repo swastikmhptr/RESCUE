@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 import torch
 import tqdm
@@ -8,6 +9,55 @@ import cv2
 
 import trimesh
 import pyrender
+
+
+def sample_video(video_path, fps, output_dir=None):
+    """
+    Sample frames from a video at a given fps and save them as JPEGs.
+
+    Args:
+        video_path (str): Path to the input video file.
+        fps (float): Frames per second to sample at.
+        output_dir (str, optional): Directory to save frames. If None, a
+            temporary directory is created. The caller is responsible for
+            cleanup in that case.
+
+    Returns:
+        tuple:
+            - str: Path to the directory containing the sampled frames (frame_0000.jpg, ...).
+            - list[int]: Source frame indices that were sampled, usable as a numpy index array.
+    """
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp()
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_interval = video_fps / fps   # read every Nth source frame
+
+    frame_idx = 0    # source frame counter
+    saved_idx = 0    # output file counter
+    sampled_indices = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % round(frame_interval) == 0:
+            out_path = os.path.join(output_dir, f"frame_{saved_idx:04d}.jpg")
+            cv2.imwrite(out_path, frame)
+            sampled_indices.append(frame_idx)
+            saved_idx += 1
+
+        frame_idx += 1
+
+    cap.release()
+    return output_dir, sampled_indices
 
 
 def get_png_from_naip(naip_path):
