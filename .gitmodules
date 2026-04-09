@@ -1,0 +1,3 @@
+[submodule "lseg-minimal"]
+	path = lseg-minimal
+	url = https://github.com/krrish94/lseg-minimal.git
