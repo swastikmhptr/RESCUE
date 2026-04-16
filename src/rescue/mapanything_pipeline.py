@@ -2,8 +2,9 @@ import os
 import gc
 import torch
 import shutil
-from mapanything.models import MapAnything
+from mapanything.models import MapAnything, init_model_from_config
 from mapanything.utils.image import load_images
+from mapanything.utils.inference import postprocess_model_outputs_for_inference
 from huggingface_hub import snapshot_download
 from rescue.utils import sample_video
 from rescue import ges_utils
@@ -11,28 +12,131 @@ from mapanything.utils.hf_utils.viz import predictions_to_glb
 from mapanything.utils.geometry import depthmap_to_world_frame
 import numpy as np
 from safetensors.torch import save_file, load_file
-from safetensors.torch import load_file
 import clip
 from rescue.feature_reduction import TorchIncrementalPCA
 
-def run_mapanything(video_path, ges_path, fps = 2, num_views = -1, temp_dir = '../generated/temp', model_local_dir = '../generated/map-anything', device = "cuda" if torch.cuda.is_available() else "cpu"):
-    print ("Loading MapAnything model...")
-    save_path = snapshot_download("facebook/map-anything", repo_type="model", local_dir=model_local_dir)
-    model = MapAnything.from_pretrained(save_path).to(device)
+# MapAnything config name (for init_model_from_config) -> (resolution_set, norm_type for load_images)
+# See map-anything README "Running External Models" for resolution / normalization.
+_MODULAR_IMAGE_PRESETS = {
+    "mapanything": (518, "dinov2"),
+    "mapanything_v1": (518, "dinov2"),
+    "mapanything_ablations": (518, "dinov2"),
+    "modular_dust3r": (512, "dust3r"),
+    "vggt": (518, "identity"),
+    "vggt_commercial": (518, "identity"),
+    "vggt_non_pretrained": (518, "identity"),
+    "pi3": (518, "identity"),
+    "pi3x": (518, "identity"),
+    "moge_1": (518, "identity"),
+    "moge_2": (518, "identity"),
+    "dust3r": (512, "dust3r"),
+    "mast3r": (512, "dust3r"),
+    "must3r": (512, "dust3r"),
+    "pow3r": (512, "dust3r"),
+    "pow3r_ba": (512, "dust3r"),
+    "da3": (504, "dinov2"),
+    "da3_nested": (504, "dinov2"),
+}
+
+
+def _resolve_image_load_kwargs(modular_model, image_resolution_set, image_norm_type):
+    """Defaults match HF MapAnything path: 518 + dinov2."""
+    if modular_model and modular_model in _MODULAR_IMAGE_PRESETS:
+        rs, nt = _MODULAR_IMAGE_PRESETS[modular_model]
+    elif modular_model:
+        rs, nt = 518, "dinov2"
+        print(
+            f"[mapanything_pipeline] No preset for modular_model={modular_model!r}; "
+            f"using resolution_set={rs}, norm_type={nt!r}. "
+            "Override with image_resolution_set / image_norm_type if needed."
+        )
+    else:
+        rs, nt = 518, "dinov2"
+    if image_resolution_set is not None:
+        rs = image_resolution_set
+    if image_norm_type is not None:
+        nt = image_norm_type
+    return rs, nt
+
+
+def _ensure_prediction_masks(predictions):
+    """``postprocess_model_outputs_for_inference`` may omit ``mask`` if no non_ambiguous_mask; GLB helpers expect it."""
+    fixed = []
+    for p in predictions:
+        p = dict(p)
+        if "mask" not in p and "depth_z" in p:
+            p["mask"] = torch.ones_like(p["depth_z"], dtype=torch.float32)
+        fixed.append(p)
+    return fixed
+
+
+def run_mapanything(
+    video_path,
+    ges_path,
+    fps=2,
+    num_views=-1,
+    temp_dir="../generated/temp",
+    model_local_dir="../generated/map-anything",
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    hf_model_id="facebook/map-anything",
+    modular_model=None,
+    modular_machine="default",
+    image_resolution_set=None,
+    image_norm_type=None,
+    modular_postprocess_apply_mask=False,
+    modular_postprocess_mask_edges=False,
+):
+    """
+    Run reconstruction on sampled video frames.
+
+    Parameters
+    ----------
+    hf_model_id : str
+        Hugging Face repo id (or local folder) for ``MapAnything.from_pretrained`` when ``modular_model`` is None.
+    modular_model : str or None
+        If set (e.g. ``\"vggt\"``, ``\"pi3\"``, ``\"dust3r\"``), load that model via ``init_model_from_config``
+        and run ``model(views)`` instead of MapAnything ``infer``. Requires optional map-anything dependencies.
+        External wrappers typically **ignore** GES poses and use poses/geometry from the model itself.
+    modular_machine : str
+        Hydra ``machine=`` override for ``init_model_from_config`` (default ``\"default\"``).
+    image_resolution_set / image_norm_type : optional
+        Override ``load_images`` resizing/normalization; otherwise chosen from ``_MODULAR_IMAGE_PRESETS`` or 518/dinov2.
+    modular_postprocess_apply_mask / modular_postprocess_mask_edges : bool
+        Passed to ``postprocess_model_outputs_for_inference`` for the modular path. External models often lack
+        ``non_ambiguous_mask``; keep these False unless you know the model provides it.
+    """
+    dev = torch.device(device) if isinstance(device, str) else device
+
+    if modular_model:
+        print(f"Loading modular model {modular_model!r} via init_model_from_config...")
+        model = init_model_from_config(
+            modular_model, device=str(dev), machine=modular_machine
+        )
+        model.eval()
+    else:
+        print("Loading MapAnything model...")
+        save_path = snapshot_download(
+            hf_model_id, repo_type="model", local_dir=model_local_dir
+        )
+        model = MapAnything.from_pretrained(save_path).to(dev)
+        model.eval()
 
     if os.path.isdir(temp_dir):
         shutil.rmtree(temp_dir)
 
     os.makedirs(temp_dir, exist_ok=True)
-    files_dir, sampled_indices = sample_video(video_path, fps=fps, output_dir =temp_dir)
+    files_dir, sampled_indices = sample_video(video_path, fps=fps, output_dir=temp_dir)
 
-    print ("Loading images...")
+    rs, nt = _resolve_image_load_kwargs(modular_model, image_resolution_set, image_norm_type)
+    print(f"Loading images (resolution_set={rs}, norm_type={nt!r})...")
     if num_views == -1:
-        views = load_images(files_dir)
+        views = load_images(files_dir, resolution_set=rs, norm_type=nt)
     else:
-        views = load_images(files_dir)[:num_views]
+        views = load_images(files_dir, resolution_set=rs, norm_type=nt)[:num_views]
 
-    poses, c2w_list, K_list, orig_width, orig_height = ges_utils.convert_ges_to_mapanything_from_file('../generated/long_pattern.json', ref_frame = 0)
+    poses, c2w_list, K_list, orig_width, orig_height = ges_utils.convert_ges_to_mapanything_from_file(
+        ges_path, ref_frame=0
+    )
     if num_views == -1:
         poses = [poses[i] for i in sampled_indices]
         c2w_list = [c2w_list[i] for i in sampled_indices]
@@ -42,37 +146,62 @@ def run_mapanything(video_path, ges_path, fps = 2, num_views = -1, temp_dir = '.
         c2w_list = [c2w_list[i] for i in sampled_indices[:num_views]]
         K_list = [K_list[i] for i in sampled_indices[:num_views]]
 
-    assert len(views) == len(poses) == len(c2w_list) == len(K_list), 'Lengths of views, poses, c2w_list, and K_list must be equal'
+    assert len(views) == len(poses) == len(c2w_list) == len(K_list), (
+        "Lengths of views, poses, c2w_list, and K_list must be equal"
+    )
 
     for i in range(len(views)):
-        h_new, w_new = views[i]['true_shape'][0]   
+        h_new, w_new = views[i]["true_shape"][0]
         K = K_list[i].copy()
-        scale_x = w_new / orig_width            
-        scale_y = h_new / orig_height           
-        K[0, 0] *= scale_x   # fl_x
-        K[0, 2] *= scale_x   # cx
-        K[1, 1] *= scale_y   # fl_y
-        K[1, 2] *= scale_y   # cy
+        scale_x = w_new / orig_width
+        scale_y = h_new / orig_height
+        K[0, 0] *= scale_x  # fl_x
+        K[0, 2] *= scale_x  # cx
+        K[1, 1] *= scale_y  # fl_y
+        K[1, 2] *= scale_y  # cy
 
-        device = views[i]['img'].device
-        views[i]['intrinsics']    = torch.tensor(K, dtype=torch.float32, device=device)[None]
-        views[i]['camera_poses']  = torch.tensor(c2w_list[i], dtype=torch.float32, device=device)[None]
-        views[i]['is_metric_scale'] = False
+        # load_images() yields CPU tensors; MapAnything.infer() moves views to the model device.
+        # Modular model.forward() does not, so for that path we put geometry + img on ``dev`` here.
+        view_device = dev if modular_model else views[i]["img"].device
+        views[i]["intrinsics"] = torch.tensor(K, dtype=torch.float32, device=view_device)[
+            None
+        ]
+        views[i]["camera_poses"] = torch.tensor(
+            c2w_list[i], dtype=torch.float32, device=view_device
+        )[None]
+        views[i]["is_metric_scale"] = False
+        if modular_model:
+            views[i]["img"] = views[i]["img"].to(dev, non_blocking=True)
 
-    print ("Running MapAnything model...")
-    predictions = model.infer(
-    views,
-    memory_efficient_inference=False,   # ← change from True
-    apply_mask=True,
-    mask_edges=True,
-    use_amp=True,
-    amp_dtype="bf16",
-    )
-    print ("MapAnything model run complete...")
+    if modular_model:
+        print(f"Running modular model {modular_model!r}...")
+        with torch.inference_mode():
+            raw = model(views)
+        predictions = postprocess_model_outputs_for_inference(
+            raw,
+            views,
+            apply_mask=modular_postprocess_apply_mask,
+            mask_edges=modular_postprocess_mask_edges,
+            apply_confidence_mask=False,
+        )
+        predictions = _ensure_prediction_masks(predictions)
+        print("Modular model run complete...")
+    else:
+        print("Running MapAnything model...")
+        predictions = model.infer(
+            views,
+            memory_efficient_inference=False,
+            apply_mask=True,
+            mask_edges=True,
+            use_amp=True,
+            amp_dtype="bf16",
+        )
+        print("MapAnything model run complete...")
 
     del model
     gc.collect()
-    torch.cuda.empty_cache()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
 
     return predictions
 
