@@ -13,6 +13,7 @@ import numpy as np
 from safetensors.torch import save_file, load_file
 from safetensors.torch import load_file
 import clip
+from rescue.feature_reduction import TorchIncrementalPCA
 
 def run_mapanything(video_path, ges_path, fps = 2, num_views = -1, temp_dir = '../generated/temp', model_local_dir = '../generated/map-anything', device = "cuda" if torch.cuda.is_available() else "cpu"):
     print ("Loading MapAnything model...")
@@ -153,19 +154,20 @@ def save_mesh_to_glb(predictions, output_path, conf_percentile = 0, show_cam = F
     glbscene.export(output_path)
 
 
-def save_language_features(predictions, language_features, output_path):
+def save_language_features(predictions, language_features, output_path, ipca = None):
     """
     Save per-point language features and 3D positions for semantic querying.
+    Optionally, also saves the ipca matrix if provided.
 
     Args:
         predictions       : raw predictions list from run_mapanything()
         language_features : np.ndarray (S, H, W, D) from langseg,
                             resized to match MapAnything's (H, W) dims
         output_path       : path for the .safetensors file
+        ipca              : Optional; if provided, the ipca matrix object to save
     """
-
-
     world_points_list, mask_list = [], []
+
     for pred in predictions:
         pts3d, valid_mask = depthmap_to_world_frame(
             pred["depth_z"][0].squeeze(-1),
@@ -192,11 +194,21 @@ def save_language_features(predictions, language_features, output_path):
         feat_flat = language_features.reshape(-1, language_features.shape[-1])
         feats_out = torch.from_numpy(feat_flat[mask_flat]).to(torch.float16)
 
+    save_dict = {
+        "features":     feats_out,
+        "world_points": torch.from_numpy(pts_flat[mask_flat]).to(torch.float32),
+    }
+
+    save_dict["has_ipca"] = torch.tensor(ipca is not None)
+    
+    if ipca is not None:
+        save_dict["ipca_components"] = ipca.components
+        save_dict["ipca_singular_values"] = ipca.singular_values
+        save_dict["ipca_n_samples_seen"] = torch.tensor(ipca.n_samples_seen)
+        save_dict["ipca_n_components"] = torch.tensor(ipca.n_components)
+    
     save_file(
-        {
-            "features":     feats_out,
-            "world_points": torch.from_numpy(pts_flat[mask_flat]).to(torch.float32),
-        },
+        save_dict,
         output_path,
     )
     print(f"[MapAnything] Saved {mask_flat.sum()} points to {output_path}")
@@ -224,6 +236,21 @@ class SceneQueryer:
         data              = load_file(features_path)
         self.features     = data["features"].to(torch.float32).to(device)
         self.world_points = data["world_points"].to(device)
+
+        if data["has_ipca"].item():
+            print (data['ipca_components'].shape)
+            print (data['ipca_singular_values'].shape)
+            print (data['ipca_n_samples_seen'])
+            print (data['ipca_n_components'])
+            # exit()
+            self.ipca = TorchIncrementalPCA(
+                n_components=data["ipca_n_components"].item(),
+                components=data["ipca_components"].to(device),
+                singular_values=data["ipca_singular_values"].to(device),
+                n_samples_seen=data["ipca_n_samples_seen"].item(),
+                device=device,
+            )
+
         print(f"[SceneQueryer] Loaded {len(self.features):,} points, feature dim={self.features.shape[1]}")
 
     def query(self, text, threshold=None, top_k=None):
@@ -243,7 +270,10 @@ class SceneQueryer:
         tokens = self.tokenizer([text]).to(self.device)
         with torch.no_grad():
             text_emb = self.clip_model.encode_text(tokens).float()      # (1, D)
-        text_emb = torch.nn.functional.normalize(text_emb, dim=1)
+        text_emb = torch.nn.functional.normalize(text_emb, dim=1).float()
+
+        if self.ipca is not None:
+            text_emb = torch.nn.functional.normalize(self.ipca.transform(text_emb), dim=1)
 
         sims = (self.features @ text_emb.T).squeeze(1)                 # (N,)
 

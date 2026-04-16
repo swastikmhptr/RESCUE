@@ -28,19 +28,40 @@ from safetensors.torch import load_file
 sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
 from rescue.mapanything_pipeline import SceneQueryer
 
+# mapanything/utils/viz.py applies this after building the scene; hf_utils/viz.py
+# (used by RESCUE for GLB export) does not — so we fix orientation here for display.
+_R_GLB_UPRIGHT = trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])[:3, :3]
 
-def show_mesh(server, path):
+
+def _apply_glb_orientation(pts: np.ndarray) -> np.ndarray:
+    """Rotate centered points so +Z matches gravity like the non-hf MapAnything exporter."""
+    return np.asarray(pts, dtype=np.float64) @ _R_GLB_UPRIGHT
+
+
+def show_mesh(server, path, apply_orientation_fix: bool):
     scene    = trimesh.load(path)
     combined = trimesh.util.concatenate(list(scene.geometry.values()))
     center   = combined.centroid
     combined.vertices -= center
+    if apply_orientation_fix:
+        combined.vertices[:, :] = _apply_glb_orientation(combined.vertices)
+    vmin = np.asarray(combined.vertices.min(axis=0))
+    vmax = np.asarray(combined.vertices.max(axis=0))
 
     print(f"Mesh: {len(combined.vertices):,} vertices, {len(combined.faces):,} faces")
     server.scene.add_mesh_trimesh(name="reconstruction", mesh=combined)
     print(f"Centered at {center}")
+    return center, vmin, vmax
 
 
-def show_points(server, path, max_points=500_000, point_size=0.05, center_override=None):
+def show_points(
+    server,
+    path,
+    max_points=500_000,
+    point_size=0.05,
+    center_override=None,
+    apply_orientation_fix: bool = True,
+):
     scene = trimesh.load(path)
     all_pts, all_colors = [], []
     for geom in scene.geometry.values():
@@ -66,7 +87,9 @@ def show_points(server, path, max_points=500_000, point_size=0.05, center_overri
         print(f"Uniformly downsampled to {max_points:,} points")
 
     center = center_override if center_override is not None else pts.mean(axis=0)
-    pts   -= center
+    pts -= center
+    if apply_orientation_fix:
+        pts = _apply_glb_orientation(pts)
 
     print(f"Points: {len(pts):,}")
     print(f"X: [{pts[:,0].min():.2f}, {pts[:,0].max():.2f}]")
@@ -84,7 +107,13 @@ def show_points(server, path, max_points=500_000, point_size=0.05, center_overri
     return center, pts.min(axis=0), pts.max(axis=0)
 
 
-def show_query(server, features_path, center, point_size=0.05):
+def show_query(
+    server,
+    features_path,
+    center,
+    point_size=0.05,
+    apply_orientation_fix: bool = True,
+):
     scene_query = SceneQueryer(features_path)
 
     query_text = server.gui.add_text("Query",        initial_value="building")
@@ -101,6 +130,8 @@ def show_query(server, features_path, center, point_size=0.05):
 
         points, sims = scene_query.query(query_text.value, threshold=threshold.value)
         points = points.cpu().numpy() - center
+        if apply_orientation_fix:
+            points = _apply_glb_orientation(points)
         N = len(points)
         print(f"Query '{query_text.value}': {N:,} matched points (threshold={threshold.value})")
 
@@ -142,7 +173,12 @@ def main():
     parser.add_argument("--point_size", type=float, default=0.05)
     parser.add_argument("--max_points", type=int, default=5000000)
     parser.add_argument("--view",       choices=["top", "side"], default="top",
-                        help="Initial camera view: 'top' (from +Z looking up) or 'side' (from +Y looking in).")
+                        help="Initial camera: 'top' nadir from +Z toward origin; 'side' from +Y toward origin (ENU: Z up).")
+    parser.add_argument(
+        "--no-orientation-fix",
+        action="store_true",
+        help="Skip 180° X rotation (hf_utils GLB export omits it; other GLBs may already be upright).",
+    )
     args = parser.parse_args()
 
     mode = args.mode or detect_mode(args.glb)
@@ -161,38 +197,46 @@ def main():
         center_override = wp.mean(axis=0)
         print(f"Center derived from features: {center_override}")
 
+    fix = not args.no_orientation_fix
+    print(f"GLB 180° X orientation fix: {'on' if fix else 'off'}")
+
     if mode == "mesh":
-        show_mesh(server, args.glb)
-        center  = np.zeros(3)
-        pts_min = np.full(3, -5.0)
-        pts_max = np.full(3,  5.0)
+        center, pts_min, pts_max = show_mesh(server, args.glb, fix)
     else:
         center, pts_min, pts_max = show_points(
             server, args.glb, args.max_points, args.point_size,
             center_override=center_override,
+            apply_orientation_fix=fix,
         )
 
     if args.features is not None:
-        show_query(server, args.features, center, args.point_size)
+        show_query(server, args.features, center, args.point_size, apply_orientation_fix=fix)
 
-    server.scene.set_up_direction("-z")
+    # MapAnything / RESCUE reconstructions follow ENU-style coords: X/Y span the
+    # site, Z is vertical (+Z up). Viser's default scene up is +Z — match that so
+    # the horizontal "ground" plane (XY) and any grid read correctly in nadir.
+    server.scene.set_up_direction("+z")
     z_extent = float(pts_max[2] - pts_min[2])
     y_extent = float(pts_max[1] - pts_min[1])
 
     if args.view == "top":
-        # Camera on the +Z side looking toward the origin; -Z is screen-up.
+        # Nadir: camera above origin on +Z, look straight down; screen-up = +Y (North).
         cam_pos = (0.0, 0.0, float(pts_max[2] + z_extent * 2.0))
+        cam_up = (0.0, 1.0, 0.0)
     else:  # side
-        # Camera on the +Y side looking toward the origin; -Z is screen-up.
         cam_pos = (0.0, float(pts_max[1] + y_extent * 2.0), 0.0)
+        cam_up = (0.0, 0.0, 1.0)
 
-    @server.on_client_connect
-    def _(client):
-        client.camera.position     = cam_pos
-        client.camera.look_at      = (0.0, 0.0, 0.0)
-        client.camera.up_direction = (0.0, 0.0, -1.0)   # -Z is world up
+    # Use initial_camera (initial=True wire messages) instead of mutating
+    # client.camera on_connect. The latter leaves drei CameraControls out of sync
+    # with the orbit target until the first click, which shows up as a zoom jump.
+    server.initial_camera.look_at = (0.0, 0.0, 0.0)
+    server.initial_camera.up = cam_up
+    server.initial_camera.position = cam_pos
+    max_extent = float(np.linalg.norm(pts_max - pts_min))
+    server.initial_camera.far = max(1000.0, max_extent * 50.0)
 
-    print(f"Camera at {cam_pos}")
+    print(f"initial_camera position={cam_pos}  up={cam_up}  far={server.initial_camera.far}")
 
     while True:
         time.sleep(1)

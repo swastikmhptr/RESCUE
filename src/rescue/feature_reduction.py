@@ -8,12 +8,21 @@ class TorchIncrementalPCA:
     where centering distorts the embedding space.
     Processes one batch at a time using SVD-merge approach.
     """
-    def __init__(self, n_components=10, device=None):
+    def __init__(self, n_components=10, device=None, components=None, singular_values=None, n_samples_seen=0):
+        if components is not None:
+            assert n_components == components.shape[0], "n_components must match the number of columns in components"
+            assert singular_values is not None, "singular_values must be provided"
+            assert n_components == singular_values.shape[0], "n_components must match the number of rows in singular_values"
+            self.components = components
+            self.singular_values = singular_values
+            self.n_samples_seen = n_samples_seen
+        else:
+            self.components = None
+            self.singular_values = None
+            self.n_samples_seen = 0
+
         self.n_components = n_components
         self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.components = None
-        self.singular_values = None
-        self.n_samples_seen = 0
 
     def partial_fit(self, X):
         """X: (n_samples, n_features)"""
