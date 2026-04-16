@@ -115,18 +115,42 @@ def show_query(
     apply_orientation_fix: bool = True,
 ):
     scene_query = SceneQueryer(features_path)
+    # Viser expects either handle.remove() or scene.remove_by_name(...).
+    # scene.remove(...) is not reliable across versions and was silently failing here.
+    last_query_handle = [None]  # holds returned SceneNodeHandle from last add_* call
+
+    def _clear_query_visual() -> None:
+        h = last_query_handle[0]
+        if h is not None:
+            try:
+                h.remove()
+            except Exception as e:
+                print(f"(query) could not remove previous handle: {e}")
+            last_query_handle[0] = None
+        scene = server.scene
+        for nm in ("query", "/query"):
+            if hasattr(scene, "remove_by_name"):
+                try:
+                    scene.remove_by_name(nm)
+                except Exception:
+                    pass
+            elif hasattr(scene, "remove"):
+                try:
+                    scene.remove(nm)
+                except Exception:
+                    pass
 
     query_text = server.gui.add_text("Query",        initial_value="building")
     threshold  = server.gui.add_slider("Threshold",  min=0.0, max=1.0, step=0.01, initial_value=0.85)
-    opacity    = server.gui.add_slider("Opacity",    min=0.0, max=1.0, step=0.01, initial_value=0.5)
+    opacity    = server.gui.add_slider("Opacity",    min=0.0, max=1.0, step=0.01, initial_value=0.85)
+    render_as  = server.gui.add_dropdown("Render as", options=["points", "splats"], initial_value="splats")
+    size       = server.gui.add_slider("Size", min=0.001, max=0.25, step=0.001, initial_value=float(point_size) * 0.25)
+    stable     = server.gui.add_checkbox("Stable splats preset", initial_value=True)
+    max_query  = server.gui.add_slider("Max query points", min=1_000, max=2_000_000, step=1_000, initial_value=250_000)
     run_btn    = server.gui.add_button("Search")
 
     def do_query(_):
-        # Always clear the previous result first to avoid stale/corrupted node
-        try:
-            server.scene.remove("/query")
-        except Exception:
-            pass
+        _clear_query_visual()
 
         points, sims = scene_query.query(query_text.value, threshold=threshold.value)
         points = points.cpu().numpy() - center
@@ -138,18 +162,46 @@ def show_query(
         if N == 0:
             return
 
-        rgbs        = np.tile([1.0, 0.0, 0.0], (N, 1)).astype(np.float32)
-        opacities   = np.full((N, 1), opacity.value, dtype=np.float32)
-        cov_scale   = (point_size * 0.5) ** 2
-        covariances = np.tile(np.eye(3) * cov_scale, (N, 1, 1)).astype(np.float32)
+        # Deterministic downsample to reduce overlap flicker + frontend load.
+        max_n = int(max_query.value)
+        if N > max_n:
+            idx = np.linspace(0, N - 1, max_n, dtype=int)
+            points = points[idx]
+            N = len(points)
+            print(f"Downsampled query to {N:,} points")
 
-        server.scene.add_gaussian_splats(
-            name="query",
-            centers=points.astype(np.float32),
-            covariances=covariances,
-            rgbs=rgbs,
-            opacities=opacities,
-        )
+        # Gaussian splats are view-dependent (alpha compositing + depth sorting),
+        # so a point-cloud overlay is often a better "mask" visualization.
+        if render_as.value == "points":
+            last_query_handle[0] = server.scene.add_point_cloud(
+                name="query",
+                points=points.astype(np.float32),
+                colors=np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (N, 1)),
+                point_size=float(size.value),
+                precision="float32",
+            )
+        else:
+            # "Stable" preset: tighter splats + higher opacity.
+            if stable.value:
+                splat_opacity = 0.95
+                splat_size = float(size.value)
+                # Make splats tighter than point-size suggests.
+                cov_scale = (splat_size * 0.35) ** 2
+            else:
+                splat_opacity = float(opacity.value)
+                splat_size = float(size.value)
+                cov_scale = splat_size ** 2
+
+            rgbs        = np.tile([1.0, 0.0, 0.0], (N, 1)).astype(np.float32)
+            opacities   = np.full((N, 1), float(splat_opacity), dtype=np.float32)
+            covariances = np.tile(np.eye(3) * cov_scale, (N, 1, 1)).astype(np.float32)
+            last_query_handle[0] = server.scene.add_gaussian_splats(
+                name="query",
+                centers=points.astype(np.float32),
+                covariances=covariances,
+                rgbs=rgbs,
+                opacities=opacities,
+            )
 
     run_btn.on_click(do_query)
 
@@ -172,7 +224,7 @@ def main():
     parser.add_argument("--port",       type=int, default=8080)
     parser.add_argument("--point_size", type=float, default=0.05)
     parser.add_argument("--max_points", type=int, default=5000000)
-    parser.add_argument("--view",       choices=["top", "side"], default="top",
+    parser.add_argument("--view",       choices=["top", "side"], default="side",
                         help="Initial camera: 'top' nadir from +Z toward origin; 'side' from +Y toward origin (ENU: Z up).")
     parser.add_argument(
         "--no-orientation-fix",
@@ -238,8 +290,78 @@ def main():
 
     print(f"initial_camera position={cam_pos}  up={cam_up}  far={server.initial_camera.far}")
 
+    # --- Camera auto-rotate controls ---
+    auto_rotate = server.gui.add_checkbox("Auto-rotate (Z)", initial_value=False)
+    rotate_speed = server.gui.add_slider(
+        "Rotate speed (deg/s)", min=0.0, max=60.0, step=0.5, initial_value=8.0
+    )
+
+    # Track connected clients and per-client orbit state.
+    clients: dict[int, viser.ClientHandle] = {}
+    orbit_state: dict[int, dict[str, float]] = {}
+
+    x_extent = float(pts_max[0] - pts_min[0])
+    y_extent = float(pts_max[1] - pts_min[1])
+    default_radius = max(1e-6, max(x_extent, y_extent) * 1.5)
+
+    @server.on_client_connect
+    def _on_connect(client: viser.ClientHandle):
+        clients[client.client_id] = client
+
+    @server.on_client_disconnect
+    def _on_disconnect(client: viser.ClientHandle):
+        clients.pop(client.client_id, None)
+        orbit_state.pop(client.client_id, None)
+
+    def _ensure_orbit_state(client: viser.ClientHandle) -> dict[str, float] | None:
+        """Initialize orbit state from the current camera pose."""
+        try:
+            pos = np.asarray(client.camera.position, dtype=np.float64)
+        except Exception:
+            # Camera state not ready yet.
+            return None
+
+        r = float(np.hypot(pos[0], pos[1]))
+        # If we're on the Z axis (top-down default), give it a reasonable orbit radius.
+        if r < 1e-6:
+            r = default_radius
+            pos[0] = r
+            pos[1] = 0.0
+            try:
+                client.camera.position = (float(pos[0]), float(pos[1]), float(pos[2]))
+                client.camera.look_at = (0.0, 0.0, 0.0)
+            except Exception:
+                return None
+
+        return {"r": r, "z": float(pos[2]), "theta": float(np.arctan2(pos[1], pos[0]))}
+
     while True:
-        time.sleep(1)
+        dt = 1.0 / 30.0
+        time.sleep(dt)
+        if not auto_rotate.value:
+            continue
+
+        omega = float(rotate_speed.value) * np.pi / 180.0  # rad/s
+        dtheta = omega * dt
+
+        for client_id, client in list(clients.items()):
+            state = orbit_state.get(client_id)
+            if state is None:
+                state = _ensure_orbit_state(client)
+                if state is None:
+                    continue
+                orbit_state[client_id] = state
+
+            state["theta"] += dtheta
+            x = state["r"] * float(np.cos(state["theta"]))
+            y = state["r"] * float(np.sin(state["theta"]))
+            z = state["z"]
+            try:
+                client.camera.position = (x, y, z)
+                client.camera.look_at = (0.0, 0.0, 0.0)
+            except Exception:
+                # Client may have disconnected or not be ready.
+                orbit_state.pop(client_id, None)
 
 
 if __name__ == "__main__":
