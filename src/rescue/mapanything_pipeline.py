@@ -10,6 +10,7 @@ from rescue.utils import sample_video
 from rescue import ges_utils
 from mapanything.utils.hf_utils.viz import predictions_to_glb
 from mapanything.utils.geometry import depthmap_to_world_frame
+from mapanything.utils.colmap_export import export_predictions_to_colmap
 import numpy as np
 from safetensors.torch import save_file, load_file
 import clip
@@ -205,11 +206,11 @@ def run_mapanything(
 
     return predictions
 
-def save_points_to_glb(predictions, output_path, show_cam = False):
+def save_points_to_glb(predictions, output_path, show_cam=False):
     world_points_list = []
-    images_list       = []
-    extrinsic_list    = []
-    mask_list         = []
+    images_list = []
+    extrinsic_list = []
+    mask_list = []
 
     for pred in predictions:
         pts3d, valid_mask = depthmap_to_world_frame(
@@ -223,31 +224,31 @@ def save_points_to_glb(predictions, output_path, show_cam = False):
 
         world_points_list.append(pts3d.cpu().numpy())
         images_list.append(pred["img_no_norm"][0].cpu().numpy())
-        extrinsic_list.append(pred["camera_poses"][0].cpu().numpy())   # (4, 4) cam2world
+        extrinsic_list.append(pred["camera_poses"][0].cpu().numpy())
         mask_list.append(mask)
 
     pred_dict = {
         "world_points": np.stack(world_points_list),  # (S, H, W, 3)
-        "images":       np.stack(images_list),         # (S, H, W, 3)
-        "extrinsic":    np.stack(extrinsic_list),      # (S, 3, 4)
-        "final_mask":   np.stack(mask_list),           # (S, H, W)
+        "images": np.stack(images_list),  # (S, H, W, 3)
+        "extrinsic": np.stack(extrinsic_list),  # (S, 3, 4)
+        "final_mask": np.stack(mask_list),  # (S, H, W)
     }
 
     # Export to GLB
     glbscene = predictions_to_glb(
         pred_dict,
         show_cam=show_cam,
-        as_mesh=False,       # True = mesh, False = point cloud
-        conf_percentile=0,   # 0 = keep all points
+        as_mesh=False,  # True = mesh, False = point cloud
+        conf_percentile=0,  # 0 = keep all points
     )
     glbscene.export(output_path)
 
-def save_mesh_to_glb(predictions, output_path, conf_percentile = 0, show_cam = False):
+def save_mesh_to_glb(predictions, output_path, conf_percentile=0, show_cam=False):
     world_points_list = []
-    images_list       = []
-    extrinsic_list    = []
-    mask_list         = []
-    conf_list         = []
+    images_list = []
+    extrinsic_list = []
+    mask_list = []
+    conf_list = []
 
     for pred in predictions:
         pts3d, valid_mask = depthmap_to_world_frame(
@@ -261,29 +262,68 @@ def save_mesh_to_glb(predictions, output_path, conf_percentile = 0, show_cam = F
 
         world_points_list.append(pts3d.cpu().numpy())
         images_list.append(pred["img_no_norm"][0].cpu().numpy())
-        extrinsic_list.append(pred["camera_poses"][0].cpu().numpy())   # (4, 4) cam2world
+        extrinsic_list.append(pred["camera_poses"][0].cpu().numpy())
         mask_list.append(mask)
         conf_list.append(pred["conf"][0].squeeze(-1).cpu().numpy())
 
     pred_dict = {
         "world_points": np.stack(world_points_list),  # (S, H, W, 3)
-        "images":       np.stack(images_list),         # (S, H, W, 3)
-        "extrinsic":    np.stack(extrinsic_list),      # (S, 3, 4)
-        "final_mask":   np.stack(mask_list),           # (S, H, W)
-        "conf":         np.stack(conf_list),           # (S, H, W)
+        "images": np.stack(images_list),  # (S, H, W, 3)
+        "extrinsic": np.stack(extrinsic_list),  # (S, 3, 4)
+        "final_mask": np.stack(mask_list),  # (S, H, W)
+        "conf": np.stack(conf_list),  # (S, H, W)
     }
 
     # Export to GLBs
     glbscene = predictions_to_glb(
         pred_dict,
         show_cam=show_cam,
-        as_mesh=True,       # True = mesh, False = point cloud
-        conf_percentile=conf_percentile,   # 0 = keep all points
+        as_mesh=True,  # True = mesh, False = point cloud
+        conf_percentile=conf_percentile,  # 0 = keep all points
     )
     glbscene.export(output_path)
 
+def save_colmap(
+    predictions,
+    output_dir,
+    export_points=True,
+    export_images=True,
+    image_names=None,
+    **kwargs,
+):
+    """
+    Save predictions to COLMAP-compatible folder structure using MapAnything's built-in exporter.
 
-def save_language_features(predictions, language_features, output_path, ipca = None):
+    Args:
+        predictions: list from run_mapanything
+        output_dir: target directory for COLMAP output
+        export_points: if True, save ``points.ply`` under ``sparse/`` (same as ``save_ply``)
+        export_images: if True, save denormalized frames under ``images/`` (same as ``save_images``)
+        image_names: one basename per frame for ``images/``; if None, uses ``frame_000000.jpg``, ...
+        kwargs: forwarded to ``export_predictions_to_colmap`` (e.g. ``voxel_fraction``, ``skip_point2d``)
+    """
+    print(f"[COLMAP Export] Saving predictions to {output_dir} ...")
+    os.makedirs(output_dir, exist_ok=True)
+    n = len(predictions)
+    if image_names is None:
+        image_names = [f"frame_{i:06d}.jpg" for i in range(n)]
+    elif len(image_names) != n:
+        raise ValueError(
+            f"image_names length ({len(image_names)}) must match predictions ({n})"
+        )
+    # ``processed_views`` is part of the upstream API but unused inside ``export_predictions_to_colmap``.
+    export_predictions_to_colmap(
+        outputs=predictions,
+        processed_views=predictions,
+        image_names=image_names,
+        output_dir=output_dir,
+        save_ply=export_points,
+        save_images=export_images,
+        **kwargs,
+    )
+    print(f"[COLMAP Export] COLMAP files saved in {output_dir}")
+
+def save_language_features(predictions, language_features, output_path, ipca=None):
     """
     Save per-point language features and 3D positions for semantic querying.
     Optionally, also saves the ipca matrix if provided.
@@ -309,38 +349,132 @@ def save_language_features(predictions, language_features, output_path, ipca = N
         mask_list.append(mask)
 
     world_points = np.stack(world_points_list)  # (S, H, W, 3)
-    final_mask   = np.stack(mask_list)          # (S, H, W)
+    final_mask = np.stack(mask_list)  # (S, H, W)
 
-    mask_flat = final_mask.reshape(-1)                      # (S*H*W,) numpy bool
-    pts_flat  = world_points.reshape(-1, 3)                  # (S*H*W, 3) numpy
+    mask_flat = final_mask.reshape(-1)  # (S*H*W,) numpy bool
+    pts_flat = world_points.reshape(-1, 3)  # (S*H*W, 3) numpy
 
     # language_features may be a torch Tensor or numpy array
     if isinstance(language_features, torch.Tensor):
         feat_flat = language_features.reshape(-1, language_features.shape[-1]).cpu()
-        mask_t    = torch.from_numpy(mask_flat)
+        mask_t = torch.from_numpy(mask_flat)
         feats_out = feat_flat[mask_t].to(torch.float16)
     else:
         feat_flat = language_features.reshape(-1, language_features.shape[-1])
         feats_out = torch.from_numpy(feat_flat[mask_flat]).to(torch.float16)
 
     save_dict = {
-        "features":     feats_out,
+        "features": feats_out,
         "world_points": torch.from_numpy(pts_flat[mask_flat]).to(torch.float32),
     }
 
     save_dict["has_ipca"] = torch.tensor(ipca is not None)
-    
+
     if ipca is not None:
         save_dict["ipca_components"] = ipca.components
         save_dict["ipca_singular_values"] = ipca.singular_values
         save_dict["ipca_n_samples_seen"] = torch.tensor(ipca.n_samples_seen)
         save_dict["ipca_n_components"] = torch.tensor(ipca.n_components)
-    
+
     save_file(
         save_dict,
         output_path,
     )
     print(f"[MapAnything] Saved {mask_flat.sum()} points to {output_path}")
+
+
+def integrate_tsdf(
+    predictions,
+    voxel_length: float = 0.2,
+    sdf_trunc: float = 0.8,
+    depth_trunc: float = 30.0,
+    block_count: int = 50000,
+    conf_percentile: float = 10.0,
+    outlier_nb_neighbors: int = 20,
+    outlier_std_ratio: float = 2.0,
+):
+    """
+    Fuse per-frame depth maps from run_mapanything() into a TSDF volume
+    and extract a mesh. Uses Open3D's tensor VoxelBlockGrid API (>=0.18).
+
+    Args:
+        predictions         : list of dicts from run_mapanything()
+        voxel_length        : voxel side length in world units (meters). Smaller = finer mesh.
+        sdf_trunc           : truncation band in meters; typically 4-6x voxel_length.
+        depth_trunc         : depths beyond this are ignored (meters).
+        block_count         : max voxel blocks to allocate; increase for large scenes.
+        conf_percentile     : per-frame confidence percentile below which depth is zeroed out.
+                              0 keeps all pixels; 10 drops the bottom 10% least-confident.
+                              Only applied when pred["conf"] is present.
+        outlier_nb_neighbors: neighbors to consider for statistical outlier removal on the mesh vertices.
+        outlier_std_ratio   : std-dev threshold for outlier removal; lower = more aggressive.
+
+    Returns:
+        mesh : open3d.geometry.TriangleMesh
+    """
+    try:
+        import open3d as o3d
+        import open3d.core as o3c
+    except ImportError:
+        raise ImportError("pip install open3d")
+
+    cpu = o3c.Device("CPU:0")
+
+    vbg = o3d.t.geometry.VoxelBlockGrid(
+        attr_names=("tsdf", "weight", "color"),
+        attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
+        attr_channels=((1,), (1,), (3,)),
+        voxel_size=voxel_length,
+        block_resolution=16,
+        block_count=block_count,
+        device=cpu,
+    )
+
+    for pred in predictions:
+        depth_np = np.ascontiguousarray(pred["depth_z"][0].squeeze(-1).cpu().float().numpy())
+        rgb_np = np.ascontiguousarray((pred["img_no_norm"][0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8))
+        mask_np = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
+        depth_np[~mask_np] = 0.0
+
+        if conf_percentile > 0 and "conf" in pred:
+            conf_np = pred["conf"][0].squeeze(-1).cpu().numpy()
+            valid_conf = conf_np[mask_np]
+            if valid_conf.size > 0:
+                threshold = np.percentile(valid_conf, conf_percentile)
+                depth_np[mask_np & (conf_np < threshold)] = 0.0
+
+        K = pred["intrinsics"][0].cpu().numpy()
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        c2w = pred["camera_poses"][0].cpu().numpy()
+        w2c = np.linalg.inv(c2w)
+
+        depth_t = o3d.t.geometry.Image(depth_np.astype(np.float32)).to(cpu)
+        color_t = o3d.t.geometry.Image(rgb_np).to(cpu)
+        K_t = o3c.Tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=o3c.float64)
+        T_t = o3c.Tensor(w2c, dtype=o3c.float64)
+
+        block_coords = vbg.compute_unique_block_coordinates(
+            depth_t, K_t, T_t, depth_scale=1.0, depth_max=depth_trunc
+        )
+        vbg.integrate(
+            block_coords, depth_t, color_t, K_t, K_t, T_t,
+            depth_scale=1.0, depth_max=depth_trunc
+        )
+
+    mesh = vbg.extract_triangle_mesh().to_legacy()
+    mesh.compute_vertex_normals()
+
+    if outlier_nb_neighbors > 0:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = mesh.vertices
+        _, inlier_idx = pcd.remove_statistical_outlier(
+            nb_neighbors=outlier_nb_neighbors, std_ratio=outlier_std_ratio
+        )
+        mesh = mesh.select_by_index(inlier_idx)
+        mesh.compute_vertex_normals()
+
+    return mesh
 
 
 class SceneQueryer:
@@ -355,6 +489,7 @@ class SceneQueryer:
 
     def __init__(self, features_path, clip_model_name="ViT-B/32", device="cuda"):
         self.device = device
+        self.ipca = None
 
         print(f"[SceneQueryer] Loading CLIP {clip_model_name}...")
         self.clip_model, _ = clip.load(clip_model_name, device=device)
@@ -362,15 +497,15 @@ class SceneQueryer:
         print(f"[SceneQueryer] CLIP loaded.")
 
         print(f"[SceneQueryer] Loading features from {features_path}...")
-        data              = load_file(features_path)
-        self.features     = data["features"].to(torch.float32).to(device)
+        data = load_file(features_path)
+        self.features = data["features"].to(torch.float32).to(device)
         self.world_points = data["world_points"].to(device)
 
         if data["has_ipca"].item():
-            print (data['ipca_components'].shape)
-            print (data['ipca_singular_values'].shape)
-            print (data['ipca_n_samples_seen'])
-            print (data['ipca_n_components'])
+            print(data['ipca_components'].shape)
+            print(data['ipca_singular_values'].shape)
+            print(data['ipca_n_samples_seen'])
+            print(data['ipca_n_components'])
             # exit()
             self.ipca = TorchIncrementalPCA(
                 n_components=data["ipca_n_components"].item(),

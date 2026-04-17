@@ -1,17 +1,30 @@
 """
-View a MapAnything reconstruction in viser.
+View a MapAnything (or other) reconstruction in viser.
 
-Automatically detects mesh vs point cloud from the filename suffix
-produced by run_mapanything.py (_only_mesh.glb / _only_points.glb).
+Supports **mesh** GLBs (triangulated surface) and **point cloud** GLBs.
+
+Auto-detection (in order):
+  1. Filename ends with ``mesh.glb`` → mesh; ``points.glb`` → points
+     (e.g. ``*_only_mesh.glb`` / ``*_only_points.glb`` from the RESCUE pipeline).
+  2. Otherwise inspects the file: any triangle mesh with faces → mesh; else points
+     (e.g. ``tsdf_mesh.glb``, ``reconstruction.glb``).
 
 Usage:
     # Auto-detect from filename
-    python scripts/view_reconstruction.py --glb generated/reconstructiononly_mesh.glb
-    python scripts/view_reconstruction.py --glb generated/reconstructiononly_points.glb
+    python scripts/view_reconstruction.py --glb generated/reconstruction_only_mesh.glb
+    python scripts/view_reconstruction.py --glb generated/reconstruction_only_points.glb
 
-    # Force mode
-    python scripts/view_reconstruction.py --glb generated/reconstruction.glb --mode mesh
-    python scripts/view_reconstruction.py --glb generated/reconstruction.glb --mode points
+    # Mesh from a generic path (auto from contents, or force)
+    python scripts/view_reconstruction.py --glb generated/tsdf_mesh.glb
+    python scripts/view_reconstruction.py --glb generated/foo.glb --mode mesh
+
+    # Force point mode on a file that also contains mesh geometry
+    python scripts/view_reconstruction.py --glb generated/foo.glb --mode points
+
+Troubleshooting (Viser stuck on "Loading" / no control panel):
+    Use http://127.0.0.1:PORT in the browser when the script prints host 0.0.0.0.
+    Large GLBs block the first paint until load finishes. Language-query CLIP loads
+    on first **Search** click so the 3D view can appear first.
 """
 
 import argparse
@@ -38,10 +51,19 @@ def _apply_glb_orientation(pts: np.ndarray) -> np.ndarray:
     return np.asarray(pts, dtype=np.float64) @ _R_GLB_UPRIGHT
 
 
-def show_mesh(server, path, apply_orientation_fix: bool):
+def show_mesh(server, path, apply_orientation_fix: bool, center_override=None):
+    """
+    Center mesh for display. If ``center_override`` is set (e.g. mean of ``world_points``
+    from ``--features``), use it so mesh, point cloud, and query overlays share one origin.
+    Otherwise use the mesh centroid (same idea as ``show_points`` default).
+    """
     scene    = trimesh.load(path)
     combined = trimesh.util.concatenate(list(scene.geometry.values()))
-    center   = combined.centroid
+    center = (
+        np.asarray(center_override, dtype=np.float64)
+        if center_override is not None
+        else np.asarray(combined.centroid, dtype=np.float64)
+    )
     combined.vertices -= center
     if apply_orientation_fix:
         combined.vertices[:, :] = _apply_glb_orientation(combined.vertices)
@@ -114,7 +136,18 @@ def show_query(
     point_size=0.05,
     apply_orientation_fix: bool = True,
 ):
-    scene_query = SceneQueryer(features_path)
+    # Lazy-load CLIP + safetensors on first Search. Loading them at startup blocks the
+    # main thread so the Viser web client can sit on "Loading…" with no GUI/scene.
+    scene_query_holder = [None]  # lazy SceneQueryer
+
+    def _scene_query():
+        if scene_query_holder[0] is None:
+            print(
+                "[query] First search: loading CLIP + language features (may take a minute)…"
+            )
+            scene_query_holder[0] = SceneQueryer(features_path)
+        return scene_query_holder[0]
+
     # Viser expects either handle.remove() or scene.remove_by_name(...).
     # scene.remove(...) is not reliable across versions and was silently failing here.
     last_query_handle = [None]  # holds returned SceneNodeHandle from last add_* call
@@ -152,7 +185,7 @@ def show_query(
     def do_query(_):
         _clear_query_visual()
 
-        points, sims = scene_query.query(query_text.value, threshold=threshold.value)
+        points, sims = _scene_query().query(query_text.value, threshold=threshold.value)
         points = points.cpu().numpy() - center
         if apply_orientation_fix:
             points = _apply_glb_orientation(points)
@@ -214,12 +247,39 @@ def detect_mode(path):
     return None
 
 
+def detect_mode_from_glb_contents(path: str) -> str | None:
+    """
+    Choose mesh vs points from GLB contents when the filename is ambiguous.
+
+    If any geometry is a ``Trimesh`` with at least one face, use mesh mode
+    (``show_mesh`` / ``add_mesh_trimesh``). Otherwise use point mode.
+    """
+    try:
+        scene = trimesh.load(path, force=None)
+    except Exception as e:
+        print(f"(auto-detect) could not load GLB for inspection: {e}")
+        return None
+
+    geoms: list = []
+    if isinstance(scene, trimesh.Scene):
+        geoms = list(scene.geometry.values())
+    elif isinstance(scene, trimesh.Trimesh):
+        geoms = [scene]
+
+    for g in geoms:
+        if isinstance(g, trimesh.Trimesh) and len(g.faces) > 0:
+            return "mesh"
+    if geoms:
+        return "points"
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--glb",        required=True, help="Path to .glb file")
     parser.add_argument("--features",   default=None,  help="Path to .safetensors language features file")
     parser.add_argument("--mode",       choices=["mesh", "points"], default=None,
-                        help="Display mode. Auto-detected from filename if not set.")
+                        help="Display mode. Auto: filename (*mesh.glb / *points.glb), else GLB contents.")
     parser.add_argument("--host",       default="0.0.0.0")
     parser.add_argument("--port",       type=int, default=8080)
     parser.add_argument("--point_size", type=float, default=0.05)
@@ -233,12 +293,18 @@ def main():
     )
     args = parser.parse_args()
 
-    mode = args.mode or detect_mode(args.glb)
+    mode = args.mode or detect_mode(args.glb) or detect_mode_from_glb_contents(args.glb)
     if mode is None:
-        parser.error("Could not detect mode from filename. Pass --mode mesh or --mode points.")
+        parser.error(
+            "Could not detect mesh vs points. Pass --mode mesh (triangulated surface) "
+            "or --mode points (point cloud)."
+        )
 
     server = viser.ViserServer(host=args.host, port=args.port)
-    print(f"Viser running at http://{args.host}:{args.port}  (mode={mode})")
+    print(f"Viser listening on http://{args.host}:{args.port}  (mode={mode})")
+    if args.host in ("0.0.0.0", "::"):
+        print(f"  → Open in your browser: http://127.0.0.1:{args.port}  (not 0.0.0.0)")
+    print("Loading geometry (large GLBs can take a while)…")
 
     # Derive center from safetensors world_points when available so that the
     # displayed cloud and query results share the same coordinate origin.
@@ -253,7 +319,9 @@ def main():
     print(f"GLB 180° X orientation fix: {'on' if fix else 'off'}")
 
     if mode == "mesh":
-        center, pts_min, pts_max = show_mesh(server, args.glb, fix)
+        center, pts_min, pts_max = show_mesh(
+            server, args.glb, fix, center_override=center_override
+        )
     else:
         center, pts_min, pts_max = show_points(
             server, args.glb, args.max_points, args.point_size,
