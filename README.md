@@ -1,4 +1,4 @@
-## RESCUE
+## RESCUE: Reasoning over Earth Scenes for coordinated UAS-UGS Exploration
 
 ![IIR Project Diagram](assets/iir_project_diag.png)
 
