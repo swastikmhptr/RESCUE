@@ -10,7 +10,9 @@ import cv2
 from shapely.geometry import box
 import trimesh
 import pyrender
-
+from pathlib import Path
+from PIL import Image
+from IPython.display import Image as IPyImage, display
 
 def sample_video(video_path, fps, output_dir=None):
     """
@@ -238,3 +240,40 @@ def render_3d_plot_from_above(
     color, depth = r.render(scene_to_render)
 
     return color, depth
+
+def save_images_as_gif(images, output_path, duration=100, loop=0):
+    """
+    Save a list of images as an animated GIF.
+
+    Args:
+        images: list of PIL.Image objects or numpy arrays
+        output_path: path to save the GIF
+        duration: frame duration in milliseconds
+        loop: 0 means infinite loop
+    """
+    if not images:
+        raise ValueError("images list is empty")
+
+    pil_images = []
+    for img in images:
+        if isinstance(img, Image.Image):
+            pil_images.append(img.convert("RGB"))
+        else:
+            pil_images.append(Image.fromarray(img).convert("RGB"))
+
+    output_path = str(Path(output_path))
+    pil_images[0].save(
+        output_path,
+        save_all=True,
+        append_images=pil_images[1:],
+        duration=duration,
+        loop=loop
+    )
+    return output_path
+
+def display_gif_jupyter(gif_path):
+    """
+    Display a GIF in a Jupyter notebook.
+    """
+    gif_path = str(Path(gif_path))
+    display(IPyImage(filename=gif_path))
